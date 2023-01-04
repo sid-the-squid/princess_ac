@@ -1,0 +1,226 @@
+# inspired by this thread https://github.com/esphome/feature-requests/issues/1734
+
+# note this uses the thermostat 'template' to accomplish a custom climate controller
+# an alternative could be to write a C++ custom controller as described here https://esphome.io/components/climate/custom.html
+
+# built with esphome 2022.10.2 
+
+# for reference
+# [11:12:34][C][tuya:050]:   Datapoint 3: int value (value: 21) # current temp
+# [11:12:34][C][tuya:048]:   Datapoint 1: switch (value: OFF)   # main unit on/off
+# [11:12:34][C][tuya:054]:   Datapoint 2: enum (value: 0)       # AC unit state cool/dry/fan
+# [11:12:34][C][tuya:050]:   Datapoint 4: int value (value: 25) # target temp
+# [11:12:34][C][tuya:054]:   Datapoint 5: enum (value: 0)       # fan speed
+# [11:12:34][C][tuya:048]:   Datapoint 6: switch (value: OFF)   # ocilate
+# [11:12:34][C][tuya:050]:   Datapoint 7: int value (value: 0)  # timer mins??
+# [11:12:34][C][tuya:056]:   Datapoint 8: bitmask (value: 0)
+# [11:12:34][C][tuya:048]:   Datapoint 9: switch (value: OFF)    # eco mode?
+# [11:12:34][C][tuya:048]:   Datapoint 10: switch (value: OFF)   # beep off
+# [11:12:34][C][tuya:056]:   Datapoint 50: bitmask (value: 0)
+
+# note we potenitally have setup an infinate loop with updating the virtual thermostat which updates the tuya datapoints
+# thankfully we can (currently) rely on the tuya component to NOT set a datapoint if the value hasn't changed, thus breaking the loop
+
+# also worth noting setting to 'dehumidify' mode auto sets the target temp to a value below current, 
+# that is not set here, but something the AC unit does itself
+
+# note this is written for an wemos mini D1, NOT the AC unit's factory standard ESP32
+esphome:
+  name: princess_mobile_ac
+  platform: ESP8266
+  board: d1_mini
+
+# wifi details in here
+<<: !include ./secrets.yaml
+
+captive_portal:
+
+api:
+
+logger:
+  level: DEBUG
+  baud_rate: 0  # disable serial debug as ESP8266
+
+uart:
+  - id: uart_2  # actually hardware UART0 on ESP8266
+    tx_pin: 1
+    rx_pin: 3
+    baud_rate: 9600
+
+tuya:
+  uart_id: uart_2
+  # catch datapoint updates, for updating our virtual thermostat
+  on_datapoint_update:
+    - sensor_datapoint: 1
+      datapoint_type: bool
+      then:
+        - lambda: |-
+            auto call = id(virtual_ac_climate).make_call();
+            if(!x){
+              call.set_mode("OFF");
+            }
+            else if(id(prev_mode).state==0){
+              call.set_mode("COOL");
+            }
+            else if(id(prev_mode).state==1){
+              call.set_mode("DRY");
+            }
+            else if(id(prev_mode).state==2){
+              call.set_mode("FAN_ONLY");
+            }
+            call.perform();
+    - sensor_datapoint: 4
+      datapoint_type: int
+      then:
+        - lambda: |-
+            auto call = id(virtual_ac_climate).make_call();
+            call.set_target_temperature((float)x);
+            call.perform();
+    - sensor_datapoint: 2
+      datapoint_type: enum
+      then:
+        - lambda: |-
+            auto call = id(virtual_ac_climate).make_call();
+            if(!id(ac_on_off).state){
+              call.set_mode("OFF");
+            }
+            else if(x==0x0){
+              call.set_mode("COOL");
+            }
+            else if(x==0x1){
+              call.set_mode("DRY");
+            }
+            else if(x==0x2){
+              call.set_mode("FAN_ONLY");
+            }
+            else{
+              // not what we expected, log it.
+              ESP_LOGD("main", "on_datapoint_update %s", format_hex_pretty(x).c_str());
+              return;
+            }
+            call.perform();
+    - sensor_datapoint: 5 
+      datapoint_type: enum
+      then:
+        - lambda: |-
+            auto call = id(virtual_ac_climate).make_call();
+            if(x==0x0){
+              call.set_fan_mode("LOW");
+            }
+            else if(x==0x1){
+              call.set_fan_mode("MEDIUM");
+            }
+            else if(x==0x2){
+              call.set_fan_mode("HIGH");
+            }
+            else{
+              // not what we expected, log it.
+              ESP_LOGD("main", "on_datapoint_update %s", format_hex_pretty(x).c_str());
+              return;
+            }
+            call.perform();
+
+# setup our virtual thermostat, docs here https://esphome.io/components/climate/thermostat.html
+climate:
+  - platform: thermostat
+    name: "Princess mobile AC"
+    sensor: "current_temp"
+    visual:
+      min_temperature: 16 °C
+      max_temperature: 31 °C
+      temperature_step: 1.0 °C
+    id: virtual_ac_climate
+
+    # required but not really relevent to us as the AC unit will manage this
+    min_cooling_off_time: 1s 
+    min_cooling_run_time: 1s
+    min_idle_time: 1s
+    min_fanning_off_time: 1s
+    min_fanning_run_time: 1s
+    min_fan_mode_switching_time: 1s
+    
+    # 'map' our actions/modes
+    cool_mode:
+      - switch.turn_on: ac_on_off
+      - switch.turn_off: eco
+      - lambda: |-
+          tuya_tuya->set_enum_datapoint_value(2, 0x0);
+    cool_action:
+      - switch.turn_on: ac_on_off
+      - switch.turn_off: eco
+      - lambda: |-
+          tuya_tuya->set_enum_datapoint_value(2, 0x0);
+    idle_action:
+      # required, but we don't need it
+      - logger.log: "virtual thermostat is idle"
+    off_mode:
+      - switch.turn_off: ac_on_off
+      - switch.turn_off: eco
+    dry_action:
+      - switch.turn_on: ac_on_off
+      - switch.turn_off: eco
+      - lambda: |-
+          tuya_tuya->set_enum_datapoint_value(2, 0x1);
+    fan_only_action:
+      - switch.turn_on: ac_on_off
+      - switch.turn_off: eco
+      - lambda: |-
+          tuya_tuya->set_enum_datapoint_value(2, 0x2);
+    fan_mode_low_action:
+      - lambda: |-
+          tuya_tuya->set_enum_datapoint_value(5, 0x0);
+    fan_mode_medium_action:
+      - lambda: |-
+          tuya_tuya->set_enum_datapoint_value(5, 0x1);
+    fan_mode_high_action:
+      - lambda: |-
+          tuya_tuya->set_enum_datapoint_value(5, 0x2);
+    swing_off_action:
+      - switch.turn_off: swing_on_off
+    swing_vertical_action:
+      - switch.turn_on: swing_on_off
+
+      # catch updates to pass to tuya for our setpoint temp on the AC unit
+    on_state:
+      - lambda: |-
+          tuya_tuya->set_integer_datapoint_value(4, id(virtual_ac_climate).target_temperature);
+
+
+# set up our current temp sensor (internal only)
+sensor:
+  - platform: "tuya"
+    name: "current_temp"
+    internal: true
+    id: current_temp
+    sensor_datapoint: 3
+
+    # keep this as a sensor for our own internal usage
+  - platform: "tuya"  
+    name: "prev_mode"
+    internal: true
+    id: prev_mode
+    sensor_datapoint: 2
+
+# set our tuya switch datapoints as 'switches'
+switch:
+  - platform: "tuya"
+    name: "Air conditioner beep off"
+    switch_datapoint: 10
+
+    # internal only switches
+  - platform: "tuya"
+    name: "ac_on_off"
+    id: "ac_on_off"
+    internal: true
+    switch_datapoint: 1
+  - platform: "tuya"
+    name: "swing_on_off"
+    id: "swing_on_off"
+    internal: true
+    switch_datapoint: 6
+  - platform: "tuya"
+    name: "AC ECO mode"
+    id: "eco"
+    internal: true
+    switch_datapoint: 9
+
